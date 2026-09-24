@@ -352,6 +352,53 @@ def publish(data_dir: Path, numbers: list[str], covered: list[dt.date], complain
     return True
 
 
+# ─── Checking the live API ──────────────────────────────────────────────────
+
+def smoke(get_json: Callable[[str], dict], day: dt.date) -> dict:
+    """Three requests that show how the live API behaves: its raw paging
+    metadata, whether an offset moves on to new records, how the single-day
+    filter compares with the range filter, and how long each request takes."""
+    def timed(params: dict) -> tuple[dict, float]:
+        started = time.monotonic()
+        page = get_json(API_URL + "?" + urllib.parse.urlencode(params))
+        return page, round(time.monotonic() - started, 1)
+
+    def created(page: dict) -> list:
+        records = page.get("data") or []
+        return [(r.get("attributes") or {}).get("created-date") for r in records[:1] + records[-1:]]
+
+    window = {
+        "created_date_from": f'"{day} 00:00:00"',
+        "created_date_to": f'"{day} 23:59:59"',
+        "items_per_page": PAGE_SIZE,
+    }
+    first, first_seconds = timed({**window, "offset": 0})
+    second, second_seconds = timed({**window, "offset": PAGE_SIZE})
+    single, single_seconds = timed({"created_date": f'"{day}"', "items_per_page": PAGE_SIZE})
+
+    records = first.get("data") or []
+    ids = lambda page: {r.get("id") for r in page.get("data") or []}
+    return {
+        "day": day.isoformat(),
+        "seconds_per_request": [first_seconds, second_seconds, single_seconds],
+        "top_level_keys": sorted(first),
+        "meta": first.get("meta"),
+        "links": first.get("links"),
+        "total_as_read": Fetcher._total(first),
+        "records": len(records),
+        "usable_numbers": sum(1 for r in records
+                              if normalize((r.get("attributes") or {}).get("company-phone-number"))),
+        "first_and_last_created": created(first),
+        "offset_page_meta": second.get("meta"),
+        "offset_page_records": len(second.get("data") or []),
+        "offset_page_first_and_last_created": created(second),
+        "offset_page_repeats_records": bool(ids(first) & ids(second)),
+        "single_day_filter_meta": single.get("meta"),
+        "single_day_filter_records": len(single.get("data") or []),
+        "sample_attributes": records[0].get("attributes") if records else None,
+    }
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False) -> dict:
@@ -387,7 +434,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path,
                         help="where days/ and the published list live")
     parser.add_argument("--smoke", action="store_true",
-                        help="make one request for yesterday and print a summary")
+                        help="make three requests for yesterday and print what came back")
     parser.add_argument("--force", action="store_true",
                         help="publish even if the list shrank sharply")
     args = parser.parse_args()
@@ -406,23 +453,7 @@ def main() -> None:
     now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
     if args.smoke:
-        yesterday = now.date() - dt.timedelta(days=1)
-        fetcher = Fetcher(get_json, budget=1)
-        page = fetcher._request({
-            "created_date_from": f'"{yesterday} 00:00:00"',
-            "created_date_to": f'"{yesterday} 23:59:59"',
-            "items_per_page": PAGE_SIZE,
-            "offset": 0,
-        })
-        records = page.get("data") or []
-        usable = [normalize((r.get("attributes") or {}).get("company-phone-number")) for r in records]
-        print(json.dumps({
-            "day": yesterday.isoformat(),
-            "total_for_day": Fetcher._total(page),
-            "records_this_page": len(records),
-            "usable_numbers_on_page": sum(1 for n in usable if n),
-            "sample_attributes": (records[0].get("attributes") if records else None),
-        }, indent=2))
+        print(json.dumps(smoke(get_json, now.date() - dt.timedelta(days=1)), indent=2))
         return
 
     args.data_dir.mkdir(parents=True, exist_ok=True)

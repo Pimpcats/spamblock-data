@@ -26,8 +26,13 @@ class FakeFTC:
         self.urls.append(url)
         query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
         unquote = lambda s: s.strip('"')
-        start = dt.datetime.fromisoformat(unquote(query["created_date_from"]))
-        end = dt.datetime.fromisoformat(unquote(query["created_date_to"]))
+        if "created_date" in query:  # a whole day
+            day = dt.date.fromisoformat(unquote(query["created_date"]))
+            start = dt.datetime.combine(day, dt.time(0, 0, 0))
+            end = dt.datetime.combine(day, dt.time(23, 59, 59))
+        else:
+            start = dt.datetime.fromisoformat(unquote(query["created_date_from"]))
+            end = dt.datetime.fromisoformat(unquote(query["created_date_to"]))
         size = min(int(query.get("items_per_page", 50)), 50)
         offset = int(query.get("offset", 0))
         matching = sorted(
@@ -114,6 +119,18 @@ class FetchTests(unittest.TestCase):
         query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(fake.urls[0]).query))
         self.assertTrue(query["created_date_from"].startswith('"'))
         self.assertTrue(query["created_date_to"].endswith('"'))
+
+
+class SmokeTests(unittest.TestCase):
+    def test_reports_paging_from_three_requests(self):
+        fake = FakeFTC(complaint_stream(days=1, per_day=137))
+        report = f.smoke(fake, TODAY - dt.timedelta(days=1))
+        self.assertEqual(len(fake.urls), 3)
+        self.assertEqual(report["total_as_read"], 137)
+        self.assertEqual((report["records"], report["offset_page_records"]), (50, 50))
+        self.assertFalse(report["offset_page_repeats_records"])
+        self.assertEqual(report["single_day_filter_records"], 50)
+        json.dumps(report)  # printable
 
 
 class RunTests(unittest.TestCase):
