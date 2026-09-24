@@ -1,0 +1,114 @@
+name: Update spam list
+
+# Hourly, so the first backfill (tens of thousands of API requests, 800 a run)
+# finishes within a day. Once caught up, most runs make no requests at all:
+# recent days are refreshed once a day and older days never change.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: "Only test the API key: make one request and print what comes back"
+        type: boolean
+        default: false
+      force:
+        description: "Publish even if the list shrank by more than half"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - ftc_spamlist.py
+      - test_ftc_spamlist.py
+      - DATA_README.md
+      - .github/workflows/update.yml
+
+permissions:
+  contents: write
+
+# One run at a time: two runs would each publish a data branch built from the
+# same starting point, and the second would discard the first one's days.
+concurrency:
+  group: update-spam-list
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: python3 -m unittest -v test_ftc_spamlist
+
+      - name: Smoke-test the FTC API
+        if: inputs.smoke
+        env:
+          FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
+        run: python3 ftc_spamlist.py --smoke
+
+      # Without a key every run would fail, and GitHub emails each failure.
+      # Scheduled runs skip with a warning instead; runs you start still fail.
+      - name: Check for the API key
+        id: key
+        if: ${{ !inputs.smoke }}
+        env:
+          FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
+        run: |
+          if [ -n "$FTC_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          message="No FTC_API_KEY secret. Get a free key at https://api.data.gov/signup and add it under Settings > Secrets and variables > Actions."
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            echo "::warning::$message Skipping this run."
+          else
+            echo "::error::$message"
+            exit 1
+          fi
+
+      - name: Load stored data
+        if: steps.key.outputs.present == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          # Tell "no data branch yet" (exit 2) apart from "couldn't reach it":
+          # starting fresh after a failed fetch would publish a near-empty list
+          # over the real one and discard every stored day.
+          status=0
+          git ls-remote --exit-code --heads origin data > /dev/null || status=$?
+          case "$status" in
+            0) git fetch --depth 1 origin data
+               git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/data"
+               echo "Stored days: $(ls "$RUNNER_TEMP/data/days" 2> /dev/null | wc -l)" ;;
+            2) echo "No data branch yet; starting fresh." ;;
+            *) echo "::error::Could not read the data branch (git ls-remote exited $status)."
+               exit 1 ;;
+          esac
+
+      - name: Fetch complaints and build the list
+        id: build
+        if: steps.key.outputs.present == 'true'
+        env:
+          FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: python3 ftc_spamlist.py --data-dir "$RUNNER_TEMP/data" $FORCE
+
+      # The data branch is a single commit, replaced each time, so the
+      # repository doesn't grow by a copy of the list every hour.
+      - name: Publish to the data branch
+        if: steps.build.outputs.changed == 'true'
+        working-directory: ${{ runner.temp }}/data
+        env:
+          NUMBERS: ${{ steps.build.outputs.numbers }}
+          TOKEN: ${{ github.token }}
+        run: |
+          sed "s|{{REPOSITORY}}|$GITHUB_REPOSITORY|g" "$GITHUB_WORKSPACE/DATA_README.md" > README.md
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Spam list: $NUMBERS numbers"
+          git push -f "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" HEAD:refs/heads/data
+          echo "Published $NUMBERS numbers."
