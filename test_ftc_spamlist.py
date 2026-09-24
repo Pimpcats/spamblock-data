@@ -16,10 +16,16 @@ class FakeFTC:
     """Serves complaints the way api.ftc.gov documents: at most 50 per page,
     filtered by quoted created_date_from/to, with pagination metadata."""
 
-    def __init__(self, complaints, total_key="record-total"):
+    # What the live API puts where the docs promise a count.
+    STRAY_RECORD = {"_id": "84e5432fa610264d22f95ec93d1cee03", "seq": 19479399}
+
+    def __init__(self, complaints, total_key="record-total", total="stray", ignore_offset=False):
         # complaints: list of (id, created datetime, raw phone string)
+        # total: "stray" as the live API does, "count" as documented, or None
         self.complaints = complaints
         self.total_key = total_key
+        self.total = total
+        self.ignore_offset = ignore_offset
         self.urls = []
 
     def __call__(self, url):
@@ -34,7 +40,7 @@ class FakeFTC:
             start = dt.datetime.fromisoformat(unquote(query["created_date_from"]))
             end = dt.datetime.fromisoformat(unquote(query["created_date_to"]))
         size = min(int(query.get("items_per_page", 50)), 50)
-        offset = int(query.get("offset", 0))
+        offset = 0 if self.ignore_offset else int(query.get("offset", 0))
         matching = sorted(
             (c for c in self.complaints if start <= c[1] <= end),
             key=lambda c: c[1], reverse=True,  # the API's default is DESC
@@ -49,8 +55,15 @@ class FakeFTC:
                     "created-date": when.strftime("%Y-%m-%d %H:%M:%S"),
                 },
             } for cid, when, phone in page],
-            "meta": {"records-this-page": len(page), self.total_key: len(matching)},
+            "meta": {"records-this-page": len(page), **self._total(len(matching))},
         }
+
+    def _total(self, count):
+        if self.total == "count":
+            return {self.total_key: count}
+        if self.total == "stray":
+            return {self.total_key: self.STRAY_RECORD}
+        return {}
 
 
 NOW = dt.datetime(2026, 9, 24, 18, 30, 0)
@@ -101,12 +114,35 @@ class FetchTests(unittest.TestCase):
     def test_either_spelling_of_the_total_works(self):
         data = complaint_stream(days=1, per_day=75)
         for key in ("record-total", "records-total"):
-            counts = f.Fetcher(FakeFTC(data, total_key=key)).fetch_day(TODAY - dt.timedelta(days=1))
+            counts = f.Fetcher(FakeFTC(data, total_key=key, total="count")).fetch_day(TODAY - dt.timedelta(days=1))
             self.assertEqual(sum(counts.values()), sum(1 for _, _, p in data if f.normalize(p)), key)
+
+    def test_pages_to_the_end_when_the_total_is_missing_or_junk(self):
+        for per_day, pages in [(137, 3), (100, 3), (49, 1), (0, 1)]:
+            data = complaint_stream(days=1, per_day=per_day)
+            for total in ("stray", None):
+                fake = FakeFTC(data, total=total)
+                fetcher = f.Fetcher(fake)
+                counts = fetcher.fetch_day(TODAY - dt.timedelta(days=1))
+                label = f"{per_day} complaints, total={total}"
+                self.assertEqual(sum(counts.values()), sum(1 for _, _, p in data if f.normalize(p)), label)
+                self.assertEqual(fetcher.requests, pages, label)
+
+    def test_junk_totals_read_as_unknown(self):
+        for meta in [{"record-total": FakeFTC.STRAY_RECORD}, {"record-total": None}, {},
+                     {"records-this-page": 50}, {"record-total": "many"}]:
+            self.assertIsNone(f.Fetcher._total({"meta": meta, "data": [{}] * 50}), meta)
+        self.assertEqual(f.Fetcher._total({"meta": {"record-total": "1234"}}), 1234)
+
+    def test_an_api_that_ignores_the_offset_stops_instead_of_looping(self):
+        fake = FakeFTC(complaint_stream(days=1, per_day=120), total="stray", ignore_offset=True)
+        with self.assertRaises(f.PagingStalled):
+            f.Fetcher(fake).fetch_day(TODAY - dt.timedelta(days=1))
+        self.assertEqual(len(fake.urls), 2)
 
     def test_large_windows_are_split_without_double_counting(self):
         data = complaint_stream(days=1, per_day=f.SPLIT_ABOVE + 500)
-        fake = FakeFTC(data)
+        fake = FakeFTC(data, total="count")
         counts = f.Fetcher(fake, budget=10_000).fetch_day(TODAY - dt.timedelta(days=1))
         self.assertEqual(sum(counts.values()), sum(1 for _, _, p in data if f.normalize(p)))
         # It split: no request asked for the whole day past the first page.
@@ -122,15 +158,25 @@ class FetchTests(unittest.TestCase):
 
 
 class SmokeTests(unittest.TestCase):
-    def test_reports_paging_from_three_requests(self):
-        fake = FakeFTC(complaint_stream(days=1, per_day=137))
+    def test_probes_deeper_until_the_records_run_out(self):
+        fake = FakeFTC(complaint_stream(days=1, per_day=1_500))
         report = f.smoke(fake, TODAY - dt.timedelta(days=1))
-        self.assertEqual(len(fake.urls), 3)
-        self.assertEqual(report["total_as_read"], 137)
-        self.assertEqual((report["records"], report["offset_page_records"]), (50, 50))
-        self.assertFalse(report["offset_page_repeats_records"])
-        self.assertEqual(report["single_day_filter_records"], 50)
+        self.assertIsNone(report["total_as_read"])
+        self.assertEqual(report["first_page"]["records"], 50)
+        self.assertEqual(report["deep_offsets"]["1000"]["records"], 50)
+        self.assertEqual(report["deep_offsets"]["2000"]["records"], 0)
+        self.assertNotIn("5000", report["deep_offsets"])
         json.dumps(report)  # printable
+
+    def test_reads_the_csv_links(self):
+        pages = {
+            f.DATASETS_PAGE: '<a href="/system/files/dnc-2026-09-23.csv">x</a> <a href="/b.CSV">y</a>',
+            "https://www.ftc.gov/system/files/dnc-2026-09-23.csv": "Company_Phone_Number,Created_Date\n1,2\n",
+        }
+        report = f.probe_csv(pages.__getitem__)
+        self.assertEqual(report["links"], 2)
+        self.assertEqual(report["lines"], 2)
+        self.assertEqual(report["first_lines"][0], "Company_Phone_Number,Created_Date")
 
 
 class RunTests(unittest.TestCase):

@@ -32,6 +32,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -99,6 +100,10 @@ class RateLimited(BudgetExhausted):
     """
 
 
+class PagingStalled(Exception):
+    """The API returned a full page of records already seen."""
+
+
 class Fetcher:
     """Pages through the FTC API for one day at a time.
 
@@ -126,17 +131,20 @@ class Fetcher:
         return self.get_json(API_URL + "?" + urllib.parse.urlencode(params))
 
     @staticmethod
-    def _total(page: dict) -> int:
+    def _total(page: dict) -> int | None:
+        """The record count the API reports, or None if it doesn't report one.
+
+        The docs show "record-total" in the example and "records-total" in the
+        field table. The live API sends "record-total" holding a stray
+        complaint record instead of a count, so anything that isn't a number
+        counts as unknown.
+        """
         meta = page.get("meta") or {}
-        # The docs show "record-total" in the example and "records-total" in
-        # the field table; accept either.
         for key in ("record-total", "records-total"):
-            if key in meta:
-                try:
-                    return int(meta[key])
-                except (TypeError, ValueError):
-                    pass
-        return len(page.get("data") or [])
+            value = meta.get(key)
+            if isinstance(value, (int, str)) and str(value).strip().isdigit():
+                return int(value)
+        return None
 
     def fetch_window(self, start: dt.datetime, end: dt.datetime) -> dict[str, str | None]:
         """Complaint id -> normalised number for [start, end], inclusive.
@@ -154,8 +162,9 @@ class Fetcher:
         total = self._total(first)
 
         # Large windows are halved rather than paged deep: the API doesn't
-        # document an offset ceiling, and many that don't have one.
-        if total > SPLIT_ABOVE and (end - start) > dt.timedelta(minutes=10):
+        # document an offset ceiling, and many that don't have one. Only
+        # possible when the API reports a total, which the live one doesn't.
+        if total is not None and total > SPLIT_ABOVE and (end - start) > dt.timedelta(minutes=10):
             middle = start + (end - start) / 2
             middle = middle.replace(microsecond=0)
             found = self.fetch_window(start, middle)
@@ -167,13 +176,21 @@ class Fetcher:
         offset = 0
         while True:
             records = page.get("data") or []
+            before = len(found)
             for record in records:
                 attributes = record.get("attributes") or {}
-                key = record.get("id") or f"{offset}:{len(found)}"
-                found[key] = normalize(attributes.get("company-phone-number"))
+                key = record.get("id") or attributes.get("seq") or f"{offset}:{len(found)}"
+                found[str(key)] = normalize(attributes.get("company-phone-number"))
             offset += len(records)
-            if len(records) < PAGE_SIZE or offset >= total:
+            # A short page is the last one. The total can't be used for this:
+            # the live API doesn't report one.
+            if len(records) < PAGE_SIZE:
                 return found
+            # A full page of records already seen means the offset isn't
+            # moving through the results; stop rather than loop until the
+            # budget runs out.
+            if len(found) == before:
+                raise PagingStalled(f"offset {offset} returned only records already seen")
             page = self._request({**base, "offset": offset})
 
     def fetch_day(self, day: dt.date) -> dict[str, int]:
@@ -354,49 +371,86 @@ def publish(data_dir: Path, numbers: list[str], covered: list[dt.date], complain
 
 # ─── Checking the live API ──────────────────────────────────────────────────
 
-def smoke(get_json: Callable[[str], dict], day: dt.date) -> dict:
-    """Three requests that show how the live API behaves: its raw paging
-    metadata, whether an offset moves on to new records, how the single-day
-    filter compares with the range filter, and how long each request takes."""
-    def timed(params: dict) -> tuple[dict, float]:
-        started = time.monotonic()
-        page = get_json(API_URL + "?" + urllib.parse.urlencode(params))
-        return page, round(time.monotonic() - started, 1)
+DATASETS_PAGE = "https://www.ftc.gov/site-information/open-government/data-sets/do-not-call-data"
+PROBE_OFFSETS = (1_000, 2_000, 5_000, 10_000, 20_000, 40_000)
 
-    def created(page: dict) -> list:
-        records = page.get("data") or []
-        return [(r.get("attributes") or {}).get("created-date") for r in records[:1] + records[-1:]]
 
+def http_get_text(url: str, limit: int = 20_000_000) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (spamblock-data)"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read(limit).decode("utf-8", "replace")
+
+
+def smoke(get_json: Callable[[str], dict], day: dt.date,
+          get_text: Callable[[str], str] | None = None) -> dict:
+    """Shows how the live API behaves, for deciding how to fetch from it.
+
+    One page of `day`, then pages at increasing offsets into the same day:
+    the deepest offset that still returns records bounds the day's volume
+    (the API reports no count) and shows whether deep offsets work at all.
+    With `get_text`, also looks at the FTC's CSV downloads of the same data.
+    """
     window = {
         "created_date_from": f'"{day} 00:00:00"',
         "created_date_to": f'"{day} 23:59:59"',
         "items_per_page": PAGE_SIZE,
     }
-    first, first_seconds = timed({**window, "offset": 0})
-    second, second_seconds = timed({**window, "offset": PAGE_SIZE})
-    single, single_seconds = timed({"created_date": f'"{day}"', "items_per_page": PAGE_SIZE})
 
-    records = first.get("data") or []
-    ids = lambda page: {r.get("id") for r in page.get("data") or []}
-    return {
+    def page_at(offset: int) -> dict:
+        started = time.monotonic()
+        try:
+            page = get_json(API_URL + "?" + urllib.parse.urlencode({**window, "offset": offset}))
+        except urllib.error.HTTPError as error:
+            return {"error": error.code, "seconds": round(time.monotonic() - started, 1)}
+        records = page.get("data") or []
+        created = [(r.get("attributes") or {}).get("created-date") for r in records]
+        return {
+            "records": len(records),
+            "newest_and_oldest": [created[0], created[-1]] if created else [],
+            "seconds": round(time.monotonic() - started, 1),
+            "page": page,
+        }
+
+    first = page_at(0)
+    page = first.pop("page", {})
+    records = page.get("data") or []
+    report = {
         "day": day.isoformat(),
-        "seconds_per_request": [first_seconds, second_seconds, single_seconds],
-        "top_level_keys": sorted(first),
-        "meta": first.get("meta"),
-        "links": first.get("links"),
-        "total_as_read": Fetcher._total(first),
-        "records": len(records),
+        "first_page": first,
+        "total_as_read": Fetcher._total(page) if page else None,
         "usable_numbers": sum(1 for r in records
                               if normalize((r.get("attributes") or {}).get("company-phone-number"))),
-        "first_and_last_created": created(first),
-        "offset_page_meta": second.get("meta"),
-        "offset_page_records": len(second.get("data") or []),
-        "offset_page_first_and_last_created": created(second),
-        "offset_page_repeats_records": bool(ids(first) & ids(second)),
-        "single_day_filter_meta": single.get("meta"),
-        "single_day_filter_records": len(single.get("data") or []),
         "sample_attributes": records[0].get("attributes") if records else None,
+        "deep_offsets": {},
     }
+    for offset in PROBE_OFFSETS:
+        result = page_at(offset)
+        result.pop("page", None)
+        report["deep_offsets"][str(offset)] = result
+        if not result.get("records"):
+            break
+    if get_text:
+        report["csv_downloads"] = probe_csv(get_text)
+    return report
+
+
+def probe_csv(get_text: Callable[[str], str]) -> dict:
+    """The CSV files linked from the FTC's data-sets page: how many, what
+    they're called, and the header and size of the first one."""
+    try:
+        html = get_text(DATASETS_PAGE)
+    except Exception as error:  # a probe reports failures rather than raising
+        return {"error": repr(error)[:300]}
+    links = list(dict.fromkeys(re.findall(r'href="([^"]+\.csv[^"]*)"', html, re.IGNORECASE)))
+    report: dict = {"links": len(links), "first_links": links[:4], "last_links": links[-2:]}
+    if links:
+        url = urllib.parse.urljoin(DATASETS_PAGE, links[0])
+        try:
+            lines = get_text(url).splitlines()
+            report.update(sample_file=url, lines=len(lines), first_lines=lines[:3])
+        except Exception as error:
+            report.update(sample_file=url, error=repr(error)[:300])
+    return report
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────
@@ -434,7 +488,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path,
                         help="where days/ and the published list live")
     parser.add_argument("--smoke", action="store_true",
-                        help="make three requests for yesterday and print what came back")
+                        help="probe the API and the CSV downloads and print what came back")
     parser.add_argument("--force", action="store_true",
                         help="publish even if the list shrank sharply")
     args = parser.parse_args()
@@ -453,7 +507,7 @@ def main() -> None:
     now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
     if args.smoke:
-        print(json.dumps(smoke(get_json, now.date() - dt.timedelta(days=1)), indent=2))
+        print(json.dumps(smoke(get_json, now.date() - dt.timedelta(days=1), http_get_text), indent=2))
         return
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
