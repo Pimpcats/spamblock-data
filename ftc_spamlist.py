@@ -455,17 +455,23 @@ def probe_csv(get_text: Callable[[str], str]) -> dict:
 
 # ─── Entry point ────────────────────────────────────────────────────────────
 
-def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False) -> dict:
+def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
+        log: Callable[[str], None] = lambda message: None) -> dict:
     today = now.date()
+    wanted = days_to_fetch(data_dir, today, now)
+    log(f"{len(wanted)} days to fetch")
     fetched, stopped_early = [], False
-    for day in days_to_fetch(data_dir, today, now):
+    for day in wanted:
         try:
             counts = fetcher.fetch_day(day)
         except BudgetExhausted:
+            log(f"Stopping after {fetcher.requests} requests; the next run continues.")
             stopped_early = True
             break
         save_day(data_dir, day, counts, now)
         fetched.append(day)
+        log(f"{day}: {sum(counts.values()):,} complaints, {len(counts):,} numbers "
+            f"({fetcher.requests} requests so far)")
 
     removed = prune(data_dir, today)
     totals, covered, complaints = aggregate(data_dir, today)
@@ -512,7 +518,7 @@ def main() -> None:
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
     fetcher = Fetcher(get_json, deadline=time.monotonic() + RUN_MINUTES * 60)
-    summary = run(args.data_dir, fetcher, now, args.force)
+    summary = run(args.data_dir, fetcher, now, args.force, log=lambda m: print(m, flush=True))
     print(json.dumps(summary, indent=2))
     if out := os.environ.get("GITHUB_OUTPUT"):
         with open(out, "a") as f:
