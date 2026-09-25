@@ -33,8 +33,9 @@ where the app downloads it.
    Actions → New repository secret**. Name it `FTC_API_KEY` and paste the key
    as the value. Don't put the key anywhere else.
 3. Go to **Actions → Update spam list → Run workflow**, tick **smoke**, and
-   run it. In the log, the "Smoke-test the FTC API" step should show
-   yesterday's complaint count.
+   run it. In the log, the "Smoke-test the FTC API" step should show a page
+   of yesterday's complaints. If it says `FTC_API_KEY not set`, the secret
+   is missing or misnamed.
 4. Run it again with **smoke** unticked, or wait for the next hourly run.
 
 ## Cost

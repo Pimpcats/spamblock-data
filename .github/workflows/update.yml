@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       smoke:
-        description: "Only test the API key: make one request and print what comes back"
+        description: "Only test the API key: make a few requests and print what comes back"
         type: boolean
         default: false
       force:
