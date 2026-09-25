@@ -6,7 +6,7 @@ name: Update spam list
 # page in the Actions tab says how big the list is and how far back it reaches.
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "23 * * * *"
   workflow_dispatch:
     inputs:
       smoke:
