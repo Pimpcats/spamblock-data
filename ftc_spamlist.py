@@ -51,7 +51,6 @@ REFETCH_AFTER_HOURS = 20       # "daily", with slack for schedule drift
 REQUEST_BUDGET = 800           # per run; the key allows ~1,000 an hour
 RUN_MINUTES = 30               # stop fetching after this long; the next run
                                # continues, and the job never hits its timeout
-SPLIT_ABOVE = 4_000            # split a time window holding more records
 MAX_SHRINK = 0.5               # refuse to publish a list this much smaller
 
 SERVICE_CODES = {211, 311, 411, 511, 611, 711, 811, 911}
@@ -59,6 +58,7 @@ SERVICE_CODES = {211, 311, 411, 511, 611, 711, 811, 911}
 LIST_FILE = "spam-numbers.txt"
 META_FILE = "spam-numbers.json"
 DAYS_DIR = "days"
+PARTIAL_DIR = "partial"        # days a run stopped partway through
 
 
 # ─── Numbers ────────────────────────────────────────────────────────────────
@@ -146,11 +146,15 @@ class Fetcher:
                 return int(value)
         return None
 
-    def fetch_window(self, start: dt.datetime, end: dt.datetime) -> dict[str, str | None]:
+    def fetch_window(self, start: dt.datetime, end: dt.datetime,
+                     progress: dict | None = None) -> dict[str, str | None]:
         """Complaint id -> normalised number for [start, end], inclusive.
 
-        Keyed by id so that splitting a window can never count a complaint
-        twice, even if the API's range bounds overlap at the seam.
+        Pages until a page comes back short: the live API doesn't report a
+        total. `progress` ({"offset", "found"}) is updated after every page,
+        so when the budget runs out partway, the caller can save it and pass
+        it back in later to carry on from there. Keyed by complaint id, so
+        records seen twice across a resume are counted once.
         """
         fmt = "%Y-%m-%d %H:%M:%S"
         base = {
@@ -158,47 +162,32 @@ class Fetcher:
             "created_date_to": f'"{end.strftime(fmt)}"',
             "items_per_page": PAGE_SIZE,
         }
-        first = self._request({**base, "offset": 0})
-        total = self._total(first)
-
-        # Large windows are halved rather than paged deep: the API doesn't
-        # document an offset ceiling, and many that don't have one. Only
-        # possible when the API reports a total, which the live one doesn't.
-        if total is not None and total > SPLIT_ABOVE and (end - start) > dt.timedelta(minutes=10):
-            middle = start + (end - start) / 2
-            middle = middle.replace(microsecond=0)
-            found = self.fetch_window(start, middle)
-            found.update(self.fetch_window(middle + dt.timedelta(seconds=1), end))
-            return found
-
-        found: dict[str, str | None] = {}
-        page = first
-        offset = 0
+        if progress is None:
+            progress = {"offset": 0, "found": {}}
+        found = progress["found"]
         while True:
+            page = self._request({**base, "offset": progress["offset"]})
             records = page.get("data") or []
             before = len(found)
             for record in records:
                 attributes = record.get("attributes") or {}
-                key = record.get("id") or attributes.get("seq") or f"{offset}:{len(found)}"
+                key = record.get("id") or attributes.get("seq") or f"{progress['offset']}:{len(found)}"
                 found[str(key)] = normalize(attributes.get("company-phone-number"))
-            offset += len(records)
-            # A short page is the last one. The total can't be used for this:
-            # the live API doesn't report one.
+            progress["offset"] += len(records)
             if len(records) < PAGE_SIZE:
                 return found
             # A full page of records already seen means the offset isn't
             # moving through the results; stop rather than loop until the
             # budget runs out.
             if len(found) == before:
-                raise PagingStalled(f"offset {offset} returned only records already seen")
-            page = self._request({**base, "offset": offset})
+                raise PagingStalled(f"offset {progress['offset']} returned only records already seen")
 
-    def fetch_day(self, day: dt.date) -> dict[str, int]:
+    def fetch_day(self, day: dt.date, progress: dict | None = None) -> dict[str, int]:
         """Number -> complaint count for complaints created on `day`."""
         start = dt.datetime.combine(day, dt.time(0, 0, 0))
         end = dt.datetime.combine(day, dt.time(23, 59, 59))
         counts: dict[str, int] = {}
-        for number in self.fetch_window(start, end).values():
+        for number in self.fetch_window(start, end, progress).values():
             if number:
                 counts[number] = counts.get(number, 0) + 1
         return counts
@@ -268,6 +257,37 @@ def save_day(data_dir: Path, day: dt.date, counts: dict[str, int], now: dt.datet
     path.write_text(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+def partial_path(data_dir: Path, day: dt.date) -> Path:
+    return data_dir / PARTIAL_DIR / f"{day.isoformat()}.json"
+
+
+def load_partial(data_dir: Path, day: dt.date, now: dt.datetime) -> dict:
+    """Where an earlier run stopped in `day`, or a fresh start.
+
+    Progress older than REFETCH_AFTER_HOURS is dropped: a recent day can
+    gain complaints between runs, and starting over is cheaper than
+    reasoning about how the pages moved.
+    """
+    fresh = {"offset": 0, "found": {}}
+    path = partial_path(data_dir, day)
+    try:
+        saved = json.loads(path.read_text())
+        saved_at = dt.datetime.fromisoformat(saved["saved_at"])
+        progress = {"offset": int(saved["offset"]), "found": dict(saved["found"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return fresh
+    if now - saved_at > dt.timedelta(hours=REFETCH_AFTER_HOURS):
+        return fresh
+    return progress
+
+
+def save_partial(data_dir: Path, day: dt.date, progress: dict, now: dt.datetime) -> None:
+    path = partial_path(data_dir, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"date": day.isoformat(), "saved_at": now.isoformat(timespec="seconds"), **progress}
+    path.write_text(json.dumps(record, separators=(",", ":")) + "\n")
+
+
 def days_to_fetch(data_dir: Path, today: dt.date, now: dt.datetime) -> list[dt.date]:
     """Days in the window that are missing, or recent and not refreshed today.
 
@@ -292,7 +312,8 @@ def prune(data_dir: Path, today: dt.date) -> list[str]:
     """Delete day files that have aged out of the window (with a week's slack)."""
     removed = []
     oldest = today - dt.timedelta(days=WINDOW_DAYS + 7)
-    for path in sorted((data_dir / DAYS_DIR).glob("*.json")):
+    paths = list((data_dir / DAYS_DIR).glob("*.json")) + list((data_dir / PARTIAL_DIR).glob("*.json"))
+    for path in sorted(paths):
         try:
             day = dt.date.fromisoformat(path.stem)
         except ValueError:
@@ -460,15 +481,22 @@ def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
     today = now.date()
     wanted = days_to_fetch(data_dir, today, now)
     log(f"{len(wanted)} days to fetch")
-    fetched, stopped_early = [], False
+    fetched, stopped_early, saved_partial = [], False, False
     for day in wanted:
+        progress = load_partial(data_dir, day, now)
+        resumed_at = progress["offset"]
         try:
-            counts = fetcher.fetch_day(day)
+            counts = fetcher.fetch_day(day, progress)
         except BudgetExhausted:
+            if progress["offset"] > resumed_at:
+                save_partial(data_dir, day, progress, now)
+                saved_partial = True
+                log(f"{day}: stopped at {progress['offset']:,} complaints; the next run resumes there.")
             log(f"Stopping after {fetcher.requests} requests; the next run continues.")
             stopped_early = True
             break
         save_day(data_dir, day, counts, now)
+        partial_path(data_dir, day).unlink(missing_ok=True)
         fetched.append(day)
         log(f"{day}: {sum(counts.values()):,} complaints, {len(counts):,} numbers "
             f"({fetcher.requests} requests so far)")
@@ -485,7 +513,7 @@ def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
         "days_covered": len(covered),
         "complaints_in_window": complaints,
         "numbers": len(numbers),
-        "changed": changed or bool(fetched) or bool(removed),
+        "changed": changed or bool(fetched) or bool(removed) or saved_partial,
     }
 
 

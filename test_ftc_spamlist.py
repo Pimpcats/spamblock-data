@@ -140,15 +140,6 @@ class FetchTests(unittest.TestCase):
             f.Fetcher(fake).fetch_day(TODAY - dt.timedelta(days=1))
         self.assertEqual(len(fake.urls), 2)
 
-    def test_large_windows_are_split_without_double_counting(self):
-        data = complaint_stream(days=1, per_day=f.SPLIT_ABOVE + 500)
-        fake = FakeFTC(data, total="count")
-        counts = f.Fetcher(fake, budget=10_000).fetch_day(TODAY - dt.timedelta(days=1))
-        self.assertEqual(sum(counts.values()), sum(1 for _, _, p in data if f.normalize(p)))
-        # It split: no request asked for the whole day past the first page.
-        whole_day = [u for u in fake.urls if "00%3A00%3A00" in u and "23%3A59%3A59" in u]
-        self.assertEqual(len(whole_day), 1)
-
     def test_dates_are_sent_in_double_quotes(self):
         fake = FakeFTC([])
         f.Fetcher(fake).fetch_day(TODAY - dt.timedelta(days=1))
@@ -248,11 +239,35 @@ class RunTests(unittest.TestCase):
             f.publish(self.dir, [], [TODAY], 0, NOW)
         self.assertEqual(len((self.dir / f.LIST_FILE).read_text().split()), 3)  # untouched
 
+    def test_a_day_too_big_for_one_run_is_finished_over_several(self):
+        data = complaint_stream(days=1, per_day=1_000)  # 20 full pages, then an empty one
+        fake = FakeFTC(data)
+        yesterday = TODAY - dt.timedelta(days=1)
+        for _ in range(3):
+            summary = f.run(self.dir, f.Fetcher(fake, budget=8), NOW)
+            self.assertTrue(summary["changed"])  # progress is published even mid-day
+        # 8 + 8 + 5 requests: every page of the day fetched exactly once.
+        day_requests = [u for u in fake.urls if yesterday.isoformat() in u]
+        self.assertEqual(len(day_requests), 21)
+        self.assertEqual(f.load_day(self.dir, yesterday)["complaints"],
+                         sum(1 for _, _, p in data if f.normalize(p)))
+        self.assertFalse(f.partial_path(self.dir, yesterday).exists())
+
+    def test_stale_progress_is_dropped(self):
+        data = complaint_stream(days=1, per_day=1_000)
+        f.run(self.dir, f.Fetcher(FakeFTC(data), budget=8), NOW)
+        yesterday = TODAY - dt.timedelta(days=1)
+        self.assertEqual(f.load_partial(self.dir, yesterday, NOW)["offset"], 400)
+        a_day_later = NOW + dt.timedelta(hours=f.REFETCH_AFTER_HOURS + 1)
+        self.assertEqual(f.load_partial(self.dir, yesterday, a_day_later)["offset"], 0)
+
     def test_old_days_age_out(self):
         stale = TODAY - dt.timedelta(days=f.WINDOW_DAYS + 30)
         f.save_day(self.dir, stale, {"9092456175": 9}, NOW)
+        f.save_partial(self.dir, stale, {"offset": 50, "found": {}}, NOW)
         f.run(self.dir, f.Fetcher(FakeFTC([])), NOW)
         self.assertFalse(f.day_path(self.dir, stale).exists())
+        self.assertFalse(f.partial_path(self.dir, stale).exists())
 
     def test_output_is_ascending_ten_digit_lines(self):
         f.run(self.dir, f.Fetcher(FakeFTC(complaint_stream(days=10, per_day=300, seed=7))), NOW)

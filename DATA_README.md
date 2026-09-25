@@ -9,6 +9,7 @@ replaces the whole branch.
 | `spam-numbers.txt` | Numbers reported to the FTC at least 3 times in the last 90 days. One 10-digit North American number per line, ascending, no duplicates. |
 | `spam-numbers.json` | How many numbers, the list's SHA-256, when it was built, and which days of complaints it covers. |
 | `days/` | Complaint counts per number for each day. Kept so each update only fetches what's new. |
+| `partial/` | Where a run stopped partway through a day, so the next run picks up from there. Usually empty. |
 
 Download links:
 
