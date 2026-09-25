@@ -517,6 +517,17 @@ def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
     }
 
 
+def step_summary(summary: dict) -> str:
+    """The line shown on the run's page in the Actions tab."""
+    fetched = len(summary["fetched_days"])
+    ending = ("; the next run continues where this one stopped."
+              if summary["stopped_early"] else ".")
+    return (f"**{summary['numbers']:,} numbers** on the list, from "
+            f"{summary['complaints_in_window']:,} complaints over {summary['days_covered']} "
+            f"of the last {WINDOW_DAYS} days. This run fetched {fetched} "
+            f"day{'s' if fetched != 1 else ''} with {summary['requests']} requests{ending}\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--data-dir", type=Path,
@@ -548,6 +559,9 @@ def main() -> None:
     fetcher = Fetcher(get_json, deadline=time.monotonic() + RUN_MINUTES * 60)
     summary = run(args.data_dir, fetcher, now, args.force, log=lambda m: print(m, flush=True))
     print(json.dumps(summary, indent=2))
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a") as f:
+            f.write(step_summary(summary))
     if out := os.environ.get("GITHUB_OUTPUT"):
         with open(out, "a") as f:
             f.write(f"changed={'true' if summary['changed'] else 'false'}\n")

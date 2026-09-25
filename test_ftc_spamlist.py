@@ -261,6 +261,13 @@ class RunTests(unittest.TestCase):
         a_day_later = NOW + dt.timedelta(hours=f.REFETCH_AFTER_HOURS + 1)
         self.assertEqual(f.load_partial(self.dir, yesterday, a_day_later)["offset"], 0)
 
+    def test_the_run_summary_says_whether_more_is_coming(self):
+        stopped = f.run(self.dir, f.Fetcher(FakeFTC(complaint_stream(days=10)), budget=7), NOW)
+        self.assertIn("next run continues", f.step_summary(stopped))
+        finished = f.run(self.dir, f.Fetcher(FakeFTC(complaint_stream(days=10))), NOW)
+        self.assertNotIn("next run continues", f.step_summary(finished))
+        self.assertTrue(f.step_summary(finished).endswith(".\n"))
+
     def test_old_days_age_out(self):
         stale = TODAY - dt.timedelta(days=f.WINDOW_DAYS + 30)
         f.save_day(self.dir, stale, {"9092456175": 9}, NOW)

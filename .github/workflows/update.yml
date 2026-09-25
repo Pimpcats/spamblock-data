@@ -2,7 +2,8 @@ name: Update spam list
 
 # Hourly, so the first backfill (tens of thousands of API requests, 800 a run)
 # finishes within a day. Once caught up, most runs make no requests at all:
-# recent days are refreshed once a day and older days never change.
+# recent days are refreshed once a day and older days never change. Each run's
+# page in the Actions tab says how big the list is and how far back it reaches.
 on:
   schedule:
     - cron: "17 * * * *"
