@@ -26,7 +26,8 @@ on:
       - .github/workflows/update.yml
 
 permissions:
-  contents: write
+  contents: write   # publish the data branch
+  actions: write    # start the next run; see the last step
 
 # One run at a time: two runs would each publish a data branch built from the
 # same starting point, and the second would discard the first one's days.
@@ -37,7 +38,8 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # Fetching stops after 50 minutes (RUN_MINUTES), leaving time to publish.
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
 
@@ -114,3 +116,13 @@ jobs:
           git commit -q -m "Spam list: $NUMBERS numbers"
           git push -f "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" HEAD:refs/heads/data
           echo "Published $NUMBERS numbers."
+
+      # GitHub's hourly schedule has proved unreliable for this repository, so
+      # a run that stopped with days still to fetch starts the next one itself
+      # rather than waiting on it. Only after progress: a run that got nowhere
+      # would otherwise start another just like it, indefinitely.
+      - name: Start the next run
+        if: steps.build.outputs.stopped_early == 'true' && steps.build.outputs.progress == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run update.yml --repo "$GITHUB_REPOSITORY" --ref main

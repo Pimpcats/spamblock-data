@@ -48,9 +48,12 @@ MIN_REPORTS = 3                # reports needed within the window
 FRESH_DAYS = 7                 # recent days re-fetched daily; covers weekends
                                # and holiday closures, when the FTC posts late
 REFETCH_AFTER_HOURS = 20       # "daily", with slack for schedule drift
-REQUEST_BUDGET = 800           # per run; the key allows ~1,000 an hour
-RUN_MINUTES = 30               # stop fetching after this long; the next run
-                               # continues, and the job never hits its timeout
+REQUEST_BUDGET = 1_500         # per run, a safety cap: the key's limit of
+                               # ~1,000 an hour sets the actual pace
+RUN_MINUTES = 50               # stop fetching after this long and publish, so
+                               # a failed run loses at most this much; the next
+                               # run continues
+RATE_LIMIT_WAIT = 10 * 60      # seconds to wait when the key's hourly limit is hit
 MAX_SHRINK = 0.5               # refuse to publish a list this much smaller
 
 SERVICE_CODES = {211, 311, 411, 511, 611, 711, 811, 911}
@@ -107,28 +110,42 @@ class PagingStalled(Exception):
 class Fetcher:
     """Pages through the FTC API for one day at a time.
 
-    `get_json` and `clock` are injected so tests can stand in for the network
-    and for time. `deadline` is a `clock()` value after which no new request
-    starts.
+    `get_json`, `clock` and `sleep` are injected so tests can stand in for
+    the network and for time. `deadline` is a `clock()` value after which no
+    new request starts.
     """
 
     def __init__(self, get_json: Callable[[str], dict], budget: int = REQUEST_BUDGET,
-                 deadline: float | None = None, clock: Callable[[], float] = time.monotonic):
+                 deadline: float | None = None, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep):
         self.get_json = get_json
         self.remaining = budget
         self.deadline = deadline
         self.clock = clock
+        self.sleep = sleep
         self.requests = 0
+        self.waited = 0.0
 
     def _request(self, params: dict) -> dict:
-        if self.remaining <= 0:
-            raise BudgetExhausted()
-        if self.deadline is not None and self.clock() >= self.deadline:
-            raise BudgetExhausted()
-        self.remaining -= 1
-        self.requests += 1
         # Date values must be wrapped in double quotes, per the API docs.
-        return self.get_json(API_URL + "?" + urllib.parse.urlencode(params))
+        url = API_URL + "?" + urllib.parse.urlencode(params)
+        while True:
+            if self.remaining <= 0:
+                raise BudgetExhausted()
+            if self.deadline is not None and self.clock() >= self.deadline:
+                raise BudgetExhausted()
+            self.remaining -= 1
+            self.requests += 1
+            try:
+                return self.get_json(url)
+            except RateLimited:
+                # The key's hourly allowance is spent. Waiting it out beats
+                # stopping, because GitHub's hourly schedule can't be relied on
+                # to start the next run. Without time left to wait, stop.
+                if self.deadline is None or self.clock() + RATE_LIMIT_WAIT >= self.deadline:
+                    raise
+                self.sleep(RATE_LIMIT_WAIT)
+                self.waited += RATE_LIMIT_WAIT
 
     @staticmethod
     def _total(page: dict) -> int | None:
@@ -513,6 +530,8 @@ def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
         "days_covered": len(covered),
         "complaints_in_window": complaints,
         "numbers": len(numbers),
+        "waited_minutes": round(fetcher.waited / 60),
+        "progress": bool(fetched) or saved_partial,
         "changed": changed or bool(fetched) or bool(removed) or saved_partial,
     }
 
@@ -522,6 +541,8 @@ def step_summary(summary: dict) -> str:
     fetched = len(summary["fetched_days"])
     ending = ("; the next run continues where this one stopped."
               if summary["stopped_early"] else ".")
+    if summary.get("waited_minutes"):
+        ending += f" It waited {summary['waited_minutes']} minutes for the API key's hourly limit."
     return (f"**{summary['numbers']:,} numbers** on the list, from "
             f"{summary['complaints_in_window']:,} complaints over {summary['days_covered']} "
             f"of the last {WINDOW_DAYS} days. This run fetched {fetched} "
@@ -564,7 +585,8 @@ def main() -> None:
             f.write(step_summary(summary))
     if out := os.environ.get("GITHUB_OUTPUT"):
         with open(out, "a") as f:
-            f.write(f"changed={'true' if summary['changed'] else 'false'}\n")
+            for key in ("changed", "stopped_early", "progress"):
+                f.write(f"{key}={'true' if summary[key] else 'false'}\n")
             f.write(f"numbers={summary['numbers']}\n")
 
 

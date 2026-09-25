@@ -14,13 +14,16 @@ where the app downloads it.
   90 days**. Complaints aren't verified and robocallers spoof other people's
   numbers, so one report isn't enough.
 - The API returns 50 complaints per request, and a free key allows about
-  1,000 requests an hour. The first 90 days therefore take many hourly runs to
-  download, newest first. Expect a complete list within about a day. Until
-  then, the list covers the days fetched so far.
+  1,000 requests an hour. The first 90 days therefore take the better part of
+  a day to download, newest first. Until then, the list covers the days
+  fetched so far.
 - Once caught up, the first run each day refreshes the last 7 days, since the
   FTC posts weekend and holiday complaints late. The other runs do nothing.
-- Each run stops at 800 requests or 30 minutes, whichever comes first. The
-  next run picks up where it left off.
+- Each run fetches for up to 50 minutes, waiting out the key's hourly limit
+  when it hits it, then publishes. A run that stops with days still to fetch
+  starts the next one itself, because GitHub's hourly schedule can't be
+  counted on to. Each run picks up exactly where the last one stopped, even
+  partway through a day.
 - If a new list would be less than half the size of the current one, it isn't
   published. That usually means an FTC outage, not fewer spammers.
 

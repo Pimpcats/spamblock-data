@@ -208,6 +208,46 @@ class RunTests(unittest.TestCase):
         self.assertEqual(len(summary["fetched_days"]), 2)
         self.assertTrue((self.dir / f.LIST_FILE).exists())
 
+    def test_waits_out_the_hourly_limit_when_there_is_time(self):
+        fake = FakeFTC(complaint_stream(days=10, per_day=120))
+        now = {"t": 0.0}
+        calls = {"n": 0}
+        def limited_once(url):
+            calls["n"] += 1
+            if calls["n"] == 4:  # partway through the second day
+                raise f.RateLimited()
+            return fake(url)
+        fetcher = f.Fetcher(limited_once, deadline=4 * 3600, clock=lambda: now["t"],
+                            sleep=lambda seconds: now.update(t=now["t"] + seconds))
+        summary = f.run(self.dir, fetcher, NOW)
+        self.assertFalse(summary["stopped_early"])
+        self.assertEqual(summary["days_covered"], f.WINDOW_DAYS)
+        self.assertEqual(summary["waited_minutes"], f.RATE_LIMIT_WAIT // 60)
+        self.assertEqual(now["t"], f.RATE_LIMIT_WAIT)
+
+    def test_stops_at_the_hourly_limit_when_waiting_would_overrun(self):
+        fake = FakeFTC(complaint_stream(days=10, per_day=120))
+        calls = {"n": 0}
+        def limited(url):
+            calls["n"] += 1
+            if calls["n"] > 7:
+                raise f.RateLimited()
+            return fake(url)
+        slept = []
+        fetcher = f.Fetcher(limited, deadline=f.RATE_LIMIT_WAIT - 1, clock=lambda: 0.0,
+                            sleep=slept.append)
+        summary = f.run(self.dir, fetcher, NOW)
+        self.assertTrue(summary["stopped_early"])
+        self.assertTrue(summary["progress"])
+        self.assertEqual(slept, [])
+
+    def test_a_run_that_gets_nowhere_reports_no_progress(self):
+        def refused(url):
+            raise f.RateLimited()
+        summary = f.run(self.dir, f.Fetcher(refused), NOW)
+        self.assertTrue(summary["stopped_early"])
+        self.assertFalse(summary["progress"])
+
     def test_a_time_limit_stops_cleanly_like_a_spent_budget(self):
         ticks = iter(range(1_000))  # one tick per request
         fetcher = f.Fetcher(FakeFTC(complaint_stream(days=10, per_day=120)),
