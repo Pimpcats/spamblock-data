@@ -376,7 +376,7 @@ def publish(data_dir: Path, numbers: list[str], covered: list[dt.date], complain
     meta = {
         "count": len(numbers),
         "sha256": hashlib.sha256(body).hexdigest(),
-        "generated_at": now.isoformat(timespec="seconds"),
+        "generated_at": now.isoformat(timespec="seconds") + "Z",  # now is UTC
         "window_days": WINDOW_DAYS,
         "min_reports": MIN_REPORTS,
         "days_covered": len(covered),
