@@ -1,0 +1,13 @@
+{
+  "count": 25717,
+  "sha256": "2849baa264d6013b4c5ffd8c1d33ed6c91c574c53ea539981eccdb052e7e016d",
+  "generated_at": "2026-10-02T05:54:28Z",
+  "window_days": 90,
+  "min_reports": 3,
+  "days_covered": 90,
+  "first_day": "2026-07-04",
+  "last_day": "2026-10-01",
+  "complaints_in_window": 604668,
+  "source": "FTC Do Not Call Reported Calls Data (api.ftc.gov/v0/dnc-complaints)",
+  "note": "Complaint data is reported by consumers and is not verified by the FTC."
+}
