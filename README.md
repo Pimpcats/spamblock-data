@@ -26,6 +26,31 @@ where the app downloads it.
   partway through a day.
 - If a new list would be less than half the size of the current one, it isn't
   published. That usually means an FTC outage, not fewer spammers.
+- Numbers you report from the SpamBlock app are added too. See below.
+
+## Reports from the app
+
+When a spam call gets through, you can report the number in SpamBlock. The
+app blocks it on your iPhone straight away and files it here as an issue
+titled **Spam report:** and the number. The workflow runs on every such
+issue, adds the number to the list, and every SpamBlock install picks it up
+the next time it loads the list (within about a day, or right away when the
+app is opened).
+
+- **Only your reports count.** Anyone can open an issue on a public
+  repository, so issues from anyone but the repository's owner are ignored.
+- **Taking a report back** closes its issue, and the number leaves the list at
+  the next run. Closing the issue here on GitHub does the same.
+- **The app needs a token to file issues.** On github.com, go to **Settings →
+  Developer settings → Personal access tokens → Fine-grained tokens →
+  Generate new token**. Under **Repository access** choose **Only select
+  repositories** and pick `spamblock-data`; under **Permissions → Repository
+  permissions**, set **Issues** to **Read and write**. Copy the token and
+  paste it into SpamBlock (**Your reports → Shared list**), which keeps it in
+  the iPhone's Keychain. Don't put it anywhere else. When it expires, the app
+  says so and keeps your reports until you paste a new one.
+- If GitHub can't be reached during a run, the numbers already listed stay
+  listed; `reported-numbers.txt` on the `data` branch keeps the last good copy.
 
 ## Setup
 

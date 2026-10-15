@@ -6,6 +6,7 @@ import json
 import random
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -321,6 +322,104 @@ class RunTests(unittest.TestCase):
         lines = (self.dir / f.LIST_FILE).read_text().splitlines()
         self.assertEqual(lines, sorted(set(lines)))
         self.assertTrue(all(len(l) == 10 and l.isdigit() for l in lines))
+
+
+
+class FakeGitHub:
+    """Serves a repository's issues the way the REST API does: open ones only
+    when asked, filtered by creator, 100 to a page."""
+
+    def __init__(self, issues):
+        # issues: list of (title, author login, author_association, extra fields)
+        self.issues = issues
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        size, page = int(query["per_page"]), int(query["page"])
+        matching = [
+            {"title": title, "user": {"login": login}, "author_association": association,
+             "state": "open", **extra}
+            for title, login, association, extra in self.issues
+            if login == query.get("creator", login)
+        ]
+        return matching[(page - 1) * size:page * size]
+
+
+def report(number, login="Pimpcats", association="OWNER", **extra):
+    return (f"{f.REPORT_TITLE} {number}", login, association, extra)
+
+
+class ReportTests(unittest.TestCase):
+    REPO = "Pimpcats/spamblock-data"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def run_with(self, issues, data=None):
+        github = FakeGitHub(issues)
+        return f.run(self.dir, f.Fetcher(FakeFTC(data or complaint_stream(days=10))), NOW,
+                     reports=lambda: f.fetch_reports(github, self.REPO))
+
+    def listed(self):
+        return (self.dir / f.LIST_FILE).read_text().split()
+
+    def test_only_the_owners_reports_count(self):
+        summary = self.run_with([
+            report("(909) 555-0134"),
+            report("+1 213-555-0199"),
+            report("909 555 0134"),                                 # a duplicate
+            report("(415) 555-0100", login="stranger", association="NONE"),
+            report("(415) 555-0101", pull_request={"url": "…"}),  # a pull request
+            ("Spam report about the app", "Pimpcats", "OWNER", {}),
+            report("(909) 111-0134"),                              # can't ring
+        ])
+        self.assertIn("9095550134", self.listed())
+        self.assertIn("2135550199", self.listed())
+        self.assertNotIn("4155550100", self.listed())
+        self.assertNotIn("4155550101", self.listed())
+        self.assertEqual(summary["reported"], 2)
+        self.assertEqual(summary["numbers"], 5)  # three FTC repeat offenders and two reports
+        self.assertEqual((self.dir / f.REPORTED_FILE).read_text().split(), ["2135550199", "9095550134"])
+        meta = json.loads((self.dir / f.META_FILE).read_text())
+        self.assertEqual((meta["count"], meta["reported_numbers"]), (5, 2))
+
+    def test_reads_every_page(self):
+        issues = [report(f"(909) 555-{n:04d}") for n in range(150)]
+        github = FakeGitHub(issues)
+        self.assertEqual(len(f.fetch_reports(github, self.REPO)), 150)
+        self.assertEqual(len(github.urls), 2)
+
+    def test_a_withdrawn_report_leaves_the_list(self):
+        self.run_with([report("(909) 555-0134")])
+        summary = self.run_with([])
+        self.assertTrue(summary["changed"])
+        self.assertNotIn("9095550134", self.listed())
+        self.assertEqual((self.dir / f.REPORTED_FILE).read_text(), "")
+
+    def test_an_outage_keeps_the_reports_already_listed(self):
+        self.run_with([report("(909) 555-0134")])
+
+        def down():
+            raise urllib.error.URLError("unreachable")
+        summary = f.run(self.dir, f.Fetcher(FakeFTC(complaint_stream(days=10))), NOW, reports=down)
+        self.assertIn("9095550134", self.listed())
+        self.assertEqual(summary["reported"], 1)
+
+    def test_a_report_of_a_number_already_listed_is_still_recorded(self):
+        first = self.run_with([])
+        second = self.run_with([report("(909) 245-6175")])  # an FTC repeat offender
+        self.assertEqual(second["numbers"], first["numbers"])
+        self.assertTrue(second["changed"])
+        meta = json.loads((self.dir / f.META_FILE).read_text())
+        self.assertEqual(meta["reported_numbers"], 1)
+
+    def test_nothing_to_report_changes_nothing(self):
+        self.run_with([])
+        again = self.run_with([])
+        self.assertFalse(again["changed"])
+        self.assertFalse((self.dir / f.REPORTED_FILE).exists())
 
 
 if __name__ == "__main__":

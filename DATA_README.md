@@ -6,8 +6,9 @@ replaces the whole branch.
 
 | File | What it holds |
 | --- | --- |
-| `spam-numbers.txt` | Numbers reported to the FTC at least 3 times in the last 90 days. One 10-digit North American number per line, ascending, no duplicates. |
-| `spam-numbers.json` | How many numbers, the list's SHA-256, when it was built, and which days of complaints it covers. |
+| `spam-numbers.txt` | Numbers reported to the FTC at least 3 times in the last 90 days, plus the numbers in `reported-numbers.txt`. One 10-digit North American number per line, ascending, no duplicates. |
+| `spam-numbers.json` | How many numbers, the list's SHA-256, when it was built, which days of complaints it covers, and how many numbers came from the app. |
+| `reported-numbers.txt` | Numbers the repository's owner reported from the SpamBlock app, same format. Only present once there's been a report. |
 | `days/` | Complaint counts per number for each day. Kept so each update only fetches what's new. |
 | `partial/` | Where a run stopped partway through a day, so the next run picks up from there. Usually empty. |
 

@@ -13,7 +13,9 @@ Each run:
   2. stores each finished day as number/count pairs under days/;
   3. sums the last WINDOW_DAYS of days and keeps numbers reported at least
      MIN_REPORTS times;
-  4. writes spam-numbers.txt (ascending, one 10-digit number per line) and
+  4. adds the numbers the repository's owner reported from the SpamBlock app,
+     which arrive as issues (see fetch_reports);
+  5. writes spam-numbers.txt (ascending, one 10-digit number per line) and
      spam-numbers.json (count, checksum, provenance).
 
 The FTC API returns at most 50 records per request, and a free api.data.gov
@@ -60,6 +62,9 @@ SERVICE_CODES = {211, 311, 411, 511, 611, 711, 811, 911}
 
 LIST_FILE = "spam-numbers.txt"
 META_FILE = "spam-numbers.json"
+REPORTED_FILE = "reported-numbers.txt"   # the owner's reports, kept for when GitHub is down
+REPORT_TITLE = "Spam report:"            # how the app titles the issue for each report
+MAX_REPORTED = 10_000                    # more than this means something's wrong
 DAYS_DIR = "days"
 PARTIAL_DIR = "partial"        # days a run stopped partway through
 
@@ -246,6 +251,73 @@ def http_get_json(api_key: str) -> Callable[[str], dict]:
     return get
 
 
+# ─── Reports from the app ───────────────────────────────────────────────────
+
+def fetch_reports(get_json: Callable[[str], list], repository: str) -> list[str]:
+    """Numbers the repository's owner reported from the SpamBlock app, ascending.
+
+    The app files each report as an issue here, titled "Spam report:" and the
+    number, and closes it if the report is withdrawn — so the open issues are
+    the list. Only the owner's count: anyone can open an issue on a public
+    repository, and a stranger's report must not block a number for everyone.
+    """
+    owner = repository.split("/")[0]
+    numbers: set[str] = set()
+    page = 1
+    while True:
+        issues = get_json(f"https://api.github.com/repos/{repository}/issues"
+                          f"?state=open&creator={owner}&per_page=100&page={page}")
+        for issue in issues:
+            title = issue.get("title") or ""
+            if ("pull_request" in issue or issue.get("author_association") != "OWNER"
+                    or not title.startswith(REPORT_TITLE)):
+                continue
+            if number := normalize(title[len(REPORT_TITLE):]):
+                numbers.add(number)
+        if len(numbers) > MAX_REPORTED:
+            raise ValueError(f"over {MAX_REPORTED:,} reported numbers")
+        if len(issues) < 100:
+            return sorted(numbers)
+        page += 1
+
+
+def github_get_json(token: str | None) -> Callable[[str], list]:
+    """A get_json for the GitHub API, with the workflow's token when there is one."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "spamblock-data",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    def get(url: str) -> list:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+            return json.load(response)
+    return get
+
+
+def load_reported(data_dir: Path) -> list[str]:
+    path = data_dir / REPORTED_FILE
+    if not path.exists():
+        return []
+    return [n for n in path.read_text().split() if normalize(n) == n]
+
+
+def current_reports(data_dir: Path, reports: Callable[[], list[str]] | None,
+                    log: Callable[[str], None]) -> list[str]:
+    """The reported numbers to list: freshly read, or the stored ones if
+    GitHub can't be reached, so an outage doesn't unblock them for everyone."""
+    stored = load_reported(data_dir)
+    if reports is None:
+        return stored
+    try:
+        return reports()
+    except (OSError, ValueError) as error:  # network and HTTP errors, bad JSON, too many
+        log(f"Couldn't read reports ({error}); keeping the {len(stored)} already listed.")
+        return stored
+
+
 # ─── Storage ────────────────────────────────────────────────────────────────
 
 def day_path(data_dir: Path, day: dt.date) -> Path:
@@ -370,7 +442,7 @@ def render(numbers: Iterable[str]) -> bytes:
 
 
 def publish(data_dir: Path, numbers: list[str], covered: list[dt.date], complaints: int,
-            now: dt.datetime, force: bool = False) -> bool:
+            now: dt.datetime, force: bool = False, reported: int = 0) -> bool:
     """Writes the list and its metadata. Returns whether anything changed.
 
     Refuses to replace a list with one less than half its size unless forced:
@@ -381,7 +453,7 @@ def publish(data_dir: Path, numbers: list[str], covered: list[dt.date], complain
     list_path, meta_path = data_dir / LIST_FILE, data_dir / META_FILE
 
     previous = list_path.read_bytes() if list_path.exists() else None
-    if previous == body:
+    if previous == body and _stored_meta(meta_path).get("reported_numbers", 0) == reported:
         return False
     if previous and not force:
         before = previous.count(b"\n")
@@ -400,11 +472,20 @@ def publish(data_dir: Path, numbers: list[str], covered: list[dt.date], complain
         "first_day": covered[0].isoformat() if covered else None,
         "last_day": covered[-1].isoformat() if covered else None,
         "complaints_in_window": complaints,
-        "source": "FTC Do Not Call Reported Calls Data (api.ftc.gov/v0/dnc-complaints)",
+        "reported_numbers": reported,
+        "source": "FTC Do Not Call Reported Calls Data (api.ftc.gov/v0/dnc-complaints), "
+                  "plus numbers reported from the SpamBlock app by this repository's owner",
         "note": "Complaint data is reported by consumers and is not verified by the FTC.",
     }
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
     return True
+
+
+def _stored_meta(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 # ─── Checking the live API ──────────────────────────────────────────────────
@@ -494,7 +575,8 @@ def probe_csv(get_text: Callable[[str], str]) -> dict:
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
-        log: Callable[[str], None] = lambda message: None) -> dict:
+        log: Callable[[str], None] = lambda message: None,
+        reports: Callable[[], list[str]] | None = None) -> dict:
     today = now.date()
     wanted = days_to_fetch(data_dir, today, now)
     log(f"{len(wanted)} days to fetch")
@@ -520,8 +602,13 @@ def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
 
     removed = prune(data_dir, today)
     totals, covered, complaints = aggregate(data_dir, today)
-    numbers = select(totals)
-    changed = publish(data_dir, numbers, covered, complaints, now, force) if covered else False
+    reported = current_reports(data_dir, reports, log)
+    reported_changed = load_reported(data_dir) != reported
+    if reported_changed:
+        (data_dir / REPORTED_FILE).write_bytes(render(reported))
+    numbers = sorted(set(select(totals)) | set(reported))
+    changed = (publish(data_dir, numbers, covered, complaints, now, force, len(reported))
+               if covered else False)
     return {
         "fetched_days": [d.isoformat() for d in fetched],
         "pruned": removed,
@@ -530,9 +617,10 @@ def run(data_dir: Path, fetcher: Fetcher, now: dt.datetime, force: bool = False,
         "days_covered": len(covered),
         "complaints_in_window": complaints,
         "numbers": len(numbers),
+        "reported": len(reported),
         "waited_minutes": round(fetcher.waited / 60),
         "progress": bool(fetched) or saved_partial,
-        "changed": changed or bool(fetched) or bool(removed) or saved_partial,
+        "changed": changed or bool(fetched) or bool(removed) or saved_partial or reported_changed,
     }
 
 
@@ -543,9 +631,11 @@ def step_summary(summary: dict) -> str:
               if summary["stopped_early"] else ".")
     if summary.get("waited_minutes"):
         ending += f" It waited {summary['waited_minutes']} minutes for the API key's hourly limit."
+    reported = summary.get("reported", 0)
+    mine = f" and {reported:,} reported from the app" if reported else ""
     return (f"**{summary['numbers']:,} numbers** on the list, from "
             f"{summary['complaints_in_window']:,} complaints over {summary['days_covered']} "
-            f"of the last {WINDOW_DAYS} days. This run fetched {fetched} "
+            f"of the last {WINDOW_DAYS} days{mine}. This run fetched {fetched} "
             f"day{'s' if fetched != 1 else ''} with {summary['requests']} requests{ending}\n")
 
 
@@ -578,7 +668,12 @@ def main() -> None:
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
     fetcher = Fetcher(get_json, deadline=time.monotonic() + RUN_MINUTES * 60)
-    summary = run(args.data_dir, fetcher, now, args.force, log=lambda m: print(m, flush=True))
+    reports = None
+    if repository := os.environ.get("GITHUB_REPOSITORY"):
+        get_issues = github_get_json(os.environ.get("GITHUB_TOKEN"))
+        reports = lambda: fetch_reports(get_issues, repository)
+    summary = run(args.data_dir, fetcher, now, args.force,
+                  log=lambda m: print(m, flush=True), reports=reports)
     print(json.dumps(summary, indent=2))
     if path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(path, "a") as f:

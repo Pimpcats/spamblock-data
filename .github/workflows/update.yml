@@ -24,10 +24,16 @@ on:
       - test_ftc_spamlist.py
       - DATA_README.md
       - .github/workflows/update.yml
+  # The SpamBlock app files each number you report as an issue here, and
+  # closes it if you take the report back; either way the list is rebuilt
+  # straight away rather than at the next hourly run.
+  issues:
+    types: [opened, edited, closed, reopened, deleted]
 
 permissions:
   contents: write   # publish the data branch
   actions: write    # start the next run; see the last step
+  issues: read      # read the reports filed from the app
 
 # One run at a time: two runs would each publish a data branch built from the
 # same starting point, and the second would discard the first one's days.
@@ -37,6 +43,12 @@ concurrency:
 
 jobs:
   update:
+    # Anyone can open an issue on a public repository; only the owner's
+    # reports are listed, so only theirs start a run.
+    if: >-
+      github.event_name != 'issues' ||
+      (github.event.issue.author_association == 'OWNER' &&
+       startsWith(github.event.issue.title, 'Spam report:'))
     runs-on: ubuntu-latest
     # Fetching stops after 50 minutes (RUN_MINUTES), leaving time to publish.
     timeout-minutes: 70
@@ -96,6 +108,7 @@ jobs:
         if: steps.key.outputs.present == 'true'
         env:
           FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force && '--force' || '' }}
         run: python3 ftc_spamlist.py --data-dir "$RUNNER_TEMP/data" $FORCE
 
