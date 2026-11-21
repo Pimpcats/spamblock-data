@@ -1,0 +1,14 @@
+{
+  "count": 16925,
+  "sha256": "8d340de08413ff8b0d49c03bc762900db9b4e078af20100889b3eacb3b4f938e",
+  "generated_at": "2026-11-20T00:41:01Z",
+  "window_days": 90,
+  "min_reports": 3,
+  "days_covered": 90,
+  "first_day": "2026-08-22",
+  "last_day": "2026-11-19",
+  "complaints_in_window": 612602,
+  "reported_numbers": 0,
+  "source": "FTC Do Not Call Reported Calls Data (api.ftc.gov/v0/dnc-complaints), plus numbers reported from the SpamBlock app by this repository's owner",
+  "note": "Complaint data is reported by consumers and is not verified by the FTC."
+}
